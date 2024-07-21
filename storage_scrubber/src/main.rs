@@ -1,11 +1,12 @@
-use anyhow::bail;
+use anyhow::{anyhow, bail};
 use camino::Utf8PathBuf;
 use pageserver_api::shard::TenantShardId;
-use storage_scrubber::find_large_objects;
+use reqwest::Url;
 use storage_scrubber::garbage::{find_garbage, purge_garbage, PurgeMode};
 use storage_scrubber::pageserver_physical_gc::GcMode;
 use storage_scrubber::scan_pageserver_metadata::scan_metadata;
 use storage_scrubber::tenant_snapshot::SnapshotDownloader;
+use storage_scrubber::{find_large_objects, ControllerClientConfig};
 use storage_scrubber::{
     init_logging, pageserver_physical_gc::pageserver_physical_gc,
     scan_safekeeper_metadata::scan_safekeeper_metadata, BucketConfig, ConsoleConfig, NodeKind,
@@ -24,6 +25,14 @@ struct Cli {
 
     #[arg(short, long, default_value_t = false)]
     delete: bool,
+
+    #[arg(long)]
+    /// URL to storage controller.  e.g. http://127.0.0.1:1234 when using `neon_local`
+    controller_api: Option<Url>,
+
+    #[arg(long)]
+    /// JWT token for authenticating with storage controller.  Requires scope 'scrubber' or 'admin'.
+    controller_jwt: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -78,6 +87,8 @@ enum Command {
         min_size: u64,
         #[arg(short, long, default_value_t = false)]
         ignore_deltas: bool,
+        #[arg(long = "concurrency", short = 'j', default_value_t = 64)]
+        concurrency: usize,
     },
 }
 
@@ -194,7 +205,7 @@ async fn main() -> anyhow::Result<()> {
             concurrency,
         } => {
             let downloader =
-                SnapshotDownloader::new(bucket_config, tenant_id, output_path, concurrency)?;
+                SnapshotDownloader::new(bucket_config, tenant_id, output_path, concurrency).await?;
             downloader.download().await
         }
         Command::PageserverPhysicalGc {
@@ -202,18 +213,52 @@ async fn main() -> anyhow::Result<()> {
             min_age,
             mode,
         } => {
-            let summary =
-                pageserver_physical_gc(bucket_config, tenant_ids, min_age.into(), mode).await?;
+            let controller_client_conf = cli.controller_api.map(|controller_api| {
+                ControllerClientConfig {
+                    controller_api,
+                    // Default to no key: this is a convenience when working in a development environment
+                    controller_jwt: cli.controller_jwt.unwrap_or("".to_owned()),
+                }
+            });
+
+            match (&controller_client_conf, mode) {
+                (Some(_), _) => {
+                    // Any mode may run when controller API is set
+                }
+                (None, GcMode::Full) => {
+                    // The part of physical GC where we erase ancestor layers cannot be done safely without
+                    // confirming the most recent complete shard split with the controller.  Refuse to run, rather
+                    // than doing it unsafely.
+                    return Err(anyhow!("Full physical GC requires `--controller-api` and `--controller-jwt` to run"));
+                }
+                (None, GcMode::DryRun | GcMode::IndicesOnly) => {
+                    // These GcModes do not require the controller to run.
+                }
+            }
+
+            let summary = pageserver_physical_gc(
+                bucket_config,
+                controller_client_conf,
+                tenant_ids,
+                min_age.into(),
+                mode,
+            )
+            .await?;
             println!("{}", serde_json::to_string(&summary).unwrap());
             Ok(())
         }
         Command::FindLargeObjects {
             min_size,
             ignore_deltas,
+            concurrency,
         } => {
-            let summary =
-                find_large_objects::find_large_objects(bucket_config, min_size, ignore_deltas)
-                    .await?;
+            let summary = find_large_objects::find_large_objects(
+                bucket_config,
+                min_size,
+                ignore_deltas,
+                concurrency,
+            )
+            .await?;
             println!("{}", serde_json::to_string(&summary).unwrap());
             Ok(())
         }

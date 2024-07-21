@@ -31,6 +31,7 @@ import backoff
 import httpx
 import jwt
 import psycopg2
+import psycopg2.sql
 import pytest
 import requests
 import toml
@@ -86,6 +87,8 @@ from fixtures.utils import (
     wait_until,
 )
 from fixtures.utils import AuxFileStore as AuxFileStore  # reexport
+
+from .neon_api import NeonAPI, NeonApiEndpoint
 
 """
 This file contains pytest fixtures. A fixture is a test resource that can be
@@ -182,6 +185,25 @@ def versioned_pg_distrib_dir(pg_distrib_dir: Path, pg_version: PgVersion) -> Ite
 
     log.info(f"versioned_pg_distrib_dir is {versioned_dir}")
     yield versioned_dir
+
+
+@pytest.fixture(scope="session")
+def neon_api_key() -> str:
+    api_key = os.getenv("NEON_API_KEY")
+    if not api_key:
+        raise AssertionError("Set the NEON_API_KEY environment variable")
+
+    return api_key
+
+
+@pytest.fixture(scope="session")
+def neon_api_base_url() -> str:
+    return os.getenv("NEON_API_BASE_URL", "https://console-stage.neon.build/api/v2")
+
+
+@pytest.fixture(scope="session")
+def neon_api(neon_api_key: str, neon_api_base_url: str) -> NeonAPI:
+    return NeonAPI(neon_api_key, neon_api_base_url)
 
 
 def shareable_scope(fixture_name: str, config: Config) -> Literal["session", "function"]:
@@ -471,6 +493,7 @@ class NeonEnvBuilder:
         pageserver_virtual_file_io_engine: Optional[str] = None,
         pageserver_aux_file_policy: Optional[AuxFileStore] = None,
         pageserver_default_tenant_config_compaction_algorithm: Optional[Dict[str, Any]] = None,
+        safekeeper_extra_opts: Optional[list[str]] = None,
     ):
         self.repo_dir = repo_dir
         self.rust_log_override = rust_log_override
@@ -535,6 +558,8 @@ class NeonEnvBuilder:
             log.debug(f'Overriding pageserver validate_vectored_get config to "{validate}"')
 
         self.pageserver_aux_file_policy = pageserver_aux_file_policy
+
+        self.safekeeper_extra_opts = safekeeper_extra_opts
 
         assert test_name.startswith(
             "test_"
@@ -703,8 +728,30 @@ class NeonEnvBuilder:
                 self.repo_dir / "local_fs_remote_storage",
             )
 
-        if (attachments_json := Path(repo_dir / "attachments.json")).exists():
-            shutil.copyfile(attachments_json, self.repo_dir / attachments_json.name)
+        # restore storage controller (the db is small, don't bother with overlayfs)
+        storcon_db_from_dir = repo_dir / "storage_controller_db"
+        storcon_db_to_dir = self.repo_dir / "storage_controller_db"
+        log.info(f"Copying storage_controller_db from {storcon_db_from_dir} to {storcon_db_to_dir}")
+        assert storcon_db_from_dir.is_dir()
+        assert not storcon_db_to_dir.exists()
+
+        def ignore_postgres_log(path: str, _names):
+            if Path(path) == storcon_db_from_dir:
+                return {"postgres.log"}
+            return set()
+
+        shutil.copytree(storcon_db_from_dir, storcon_db_to_dir, ignore=ignore_postgres_log)
+        assert not (storcon_db_to_dir / "postgres.log").exists()
+        # NB: neon_local rewrites postgresql.conf on each start based on neon_local config. No need to patch it.
+        # However, in this new NeonEnv, the pageservers listen on different ports, and the storage controller
+        # will currently reject re-attach requests from them because the NodeMetadata isn't identical.
+        # So, from_repo_dir patches up the the storcon database.
+        patch_script_path = self.repo_dir / "storage_controller_db.startup.sql"
+        assert not patch_script_path.exists()
+        patch_script = ""
+        for ps in self.env.pageservers:
+            patch_script += f"UPDATE nodes SET listen_http_port={ps.service_port.http}, listen_pg_port={ps.service_port.pg}  WHERE node_id = '{ps.id}';"
+        patch_script_path.write_text(patch_script)
 
         # Update the config with info about tenants and timelines
         with (self.repo_dir / "config").open("r") as f:
@@ -950,7 +997,7 @@ class NeonEnvBuilder:
 
             if self.scrub_on_exit:
                 try:
-                    StorageScrubber(self).scan_metadata()
+                    self.env.storage_scrubber.scan_metadata()
                 except Exception as e:
                     log.error(f"Error during remote storage scrub: {e}")
                     cleanup_error = e
@@ -1111,6 +1158,7 @@ class NeonEnv:
                 "listen_http_addr": f"localhost:{pageserver_port.http}",
                 "pg_auth_type": pg_auth_type,
                 "http_auth_type": http_auth_type,
+                "image_compression": "zstd",
             }
             if self.pageserver_virtual_file_io_engine is not None:
                 ps_cfg["virtual_file_io_engine"] = self.pageserver_virtual_file_io_engine
@@ -1172,8 +1220,13 @@ class NeonEnv:
                 sk_cfg[
                     "remote_storage"
                 ] = self.safekeepers_remote_storage.to_toml_inline_table().strip()
-            self.safekeepers.append(Safekeeper(env=self, id=id, port=port))
+            self.safekeepers.append(
+                Safekeeper(env=self, id=id, port=port, extra_opts=config.safekeeper_extra_opts)
+            )
             cfg["safekeepers"].append(sk_cfg)
+
+        # Scrubber instance for tests that use it, and for use during teardown checks
+        self.storage_scrubber = StorageScrubber(self, log_dir=config.test_output_dir)
 
         log.info(f"Config: {cfg}")
         self.neon_cli.init(
@@ -2261,6 +2314,14 @@ class NeonStorageController(MetricsGetter, LogUtils):
             headers=self.headers(TokenScope.ADMIN),
         )
 
+    def node_delete(self, node_id):
+        log.info(f"node_delete({node_id})")
+        self.request(
+            "DELETE",
+            f"{self.env.storage_controller_api}/control/v1/node/{node_id}",
+            headers=self.headers(TokenScope.ADMIN),
+        )
+
     def node_drain(self, node_id):
         log.info(f"node_drain({node_id})")
         self.request(
@@ -2366,7 +2427,7 @@ class NeonStorageController(MetricsGetter, LogUtils):
 
     def locate(self, tenant_id: TenantId) -> list[dict[str, Any]]:
         """
-        :return: list of {"shard_id": "", "node_id": int, "listen_pg_addr": str, "listen_pg_port": int, "listen_http_addr: str, "listen_http_port: int}
+        :return: list of {"shard_id": "", "node_id": int, "listen_pg_addr": str, "listen_pg_port": int, "listen_http_addr": str, "listen_http_port": int}
         """
         response = self.request(
             "GET",
@@ -2752,8 +2813,8 @@ class NeonPageserver(PgProtocol, LogUtils):
             )
         return client.tenant_attach(
             tenant_id,
+            generation,
             config,
-            generation=generation,
         )
 
     def tenant_detach(self, tenant_id: TenantId):
@@ -2862,14 +2923,21 @@ class PgBin:
         env.update(env_add)
         return env
 
-    def run(
+    def _log_env(self, env: dict[str, str]) -> None:
+        env_s = {}
+        for k, v in env.items():
+            if k.startswith("PG") and k != "PGPASSWORD":
+                env_s[k] = v
+        log.debug(f"Environment: {env_s}")
+
+    def run_nonblocking(
         self,
         command: List[str],
         env: Optional[Env] = None,
         cwd: Optional[Union[str, Path]] = None,
-    ):
+    ) -> subprocess.Popen[Any]:
         """
-        Run one of the postgres binaries.
+        Run one of the postgres binaries, not waiting for it to finish
 
         The command should be in list form, e.g. ['pgbench', '-p', '55432']
 
@@ -2880,11 +2948,34 @@ class PgBin:
 
         If you want stdout/stderr captured to files, use `run_capture` instead.
         """
-
         self._fixpath(command)
         log.info(f"Running command '{' '.join(command)}'")
         env = self._build_env(env)
-        subprocess.run(command, env=env, cwd=cwd, check=True)
+        self._log_env(env)
+        return subprocess.Popen(command, env=env, cwd=cwd, stdout=subprocess.PIPE, text=True)
+
+    def run(
+        self,
+        command: List[str],
+        env: Optional[Env] = None,
+        cwd: Optional[Union[str, Path]] = None,
+    ) -> None:
+        """
+        Run one of the postgres binaries, waiting for it to finish
+
+        The command should be in list form, e.g. ['pgbench', '-p', '55432']
+
+        All the necessary environment variables will be set.
+
+        If the first argument (the command name) doesn't include a path (no '/'
+        characters present), then it will be edited to include the correct path.
+
+        If you want stdout/stderr captured to files, use `run_capture` instead.
+        """
+        proc = self.run_nonblocking(command, env, cwd)
+        proc.wait()
+        if proc.returncode != 0:
+            raise subprocess.CalledProcessError(proc.returncode, proc.args)
 
     def run_capture(
         self,
@@ -2904,6 +2995,7 @@ class PgBin:
         self._fixpath(command)
         log.info(f"Running command '{' '.join(command)}'")
         env = self._build_env(env)
+        self._log_env(env)
         base_path, _, _ = subprocess_capture(
             self.log_dir,
             command,
@@ -3091,6 +3183,18 @@ class RemotePostgres(PgProtocol):
     ):
         # do nothing
         pass
+
+
+@pytest.fixture(scope="function")
+def benchmark_project_pub(neon_api: NeonAPI, pg_version: PgVersion) -> NeonApiEndpoint:
+    project_id = os.getenv("BENCHMARK_PROJECT_ID_PUB")
+    return NeonApiEndpoint(neon_api, pg_version, project_id)
+
+
+@pytest.fixture(scope="function")
+def benchmark_project_sub(neon_api: NeonAPI, pg_version: PgVersion) -> NeonApiEndpoint:
+    project_id = os.getenv("BENCHMARK_PROJECT_ID_SUB")
+    return NeonApiEndpoint(neon_api, pg_version, project_id)
 
 
 @pytest.fixture(scope="function")
@@ -3708,12 +3812,12 @@ class Endpoint(PgProtocol, LogUtils):
             self.endpoint_id, self.tenant_id, pageserver_id, self.active_safekeepers
         )
 
-    def respec(self, **kwargs):
+    def respec(self, **kwargs: Any) -> None:
         """Update the endpoint.json file used by control_plane."""
         # Read config
         config_path = os.path.join(self.endpoint_path(), "endpoint.json")
         with open(config_path, "r") as f:
-            data_dict = json.load(f)
+            data_dict: dict[str, Any] = json.load(f)
 
         # Write it back updated
         with open(config_path, "w") as file:
@@ -3721,13 +3825,13 @@ class Endpoint(PgProtocol, LogUtils):
             json.dump(dict(data_dict, **kwargs), file, indent=4)
 
     # Please note: Migrations only run if pg_skip_catalog_updates is false
-    def wait_for_migrations(self):
+    def wait_for_migrations(self, num_migrations: int = 10):
         with self.cursor() as cur:
 
             def check_migrations_done():
                 cur.execute("SELECT id FROM neon_migration.migration_id")
-                migration_id = cur.fetchall()[0][0]
-                assert migration_id != 0
+                migration_id: int = cur.fetchall()[0][0]
+                assert migration_id >= num_migrations
 
             wait_until(20, 0.5, check_migrations_done)
 
@@ -3964,16 +4068,44 @@ class Safekeeper(LogUtils):
     id: int
     running: bool = False
 
-    def __init__(self, env: NeonEnv, port: SafekeeperPort, id: int, running: bool = False):
+    def __init__(
+        self,
+        env: NeonEnv,
+        port: SafekeeperPort,
+        id: int,
+        running: bool = False,
+        extra_opts: Optional[List[str]] = None,
+    ):
         self.env = env
         self.port = port
         self.id = id
         self.running = running
         self.logfile = Path(self.data_dir) / f"safekeeper-{id}.log"
 
+        if extra_opts is None:
+            # Testing defaults: enable everything, and set short timeouts so that background
+            # work will happen during short tests.
+            # **Note**: Any test that explicitly sets extra_opts will not get these defaults.
+            extra_opts = [
+                "--enable-offload",
+                "--delete-offloaded-wal",
+                "--partial-backup-timeout",
+                "10s",
+                "--control-file-save-interval",
+                "1s",
+                "--eviction-min-resident",
+                "10s",
+            ]
+
+        self.extra_opts = extra_opts
+
     def start(
         self, extra_opts: Optional[List[str]] = None, timeout_in_seconds: Optional[int] = None
     ) -> "Safekeeper":
+        if extra_opts is None:
+            # Apply either the extra_opts passed in, or the ones from our constructor: we do not merge the two.
+            extra_opts = self.extra_opts
+
         assert self.running is False
         self.env.neon_cli.safekeeper_start(
             self.id, extra_opts=extra_opts, timeout_in_seconds=timeout_in_seconds
@@ -4136,9 +4268,9 @@ class Safekeeper(LogUtils):
 
 
 class StorageScrubber:
-    def __init__(self, env: NeonEnvBuilder, log_dir: Optional[Path] = None):
+    def __init__(self, env: NeonEnv, log_dir: Path):
         self.env = env
-        self.log_dir = log_dir or env.test_output_dir
+        self.log_dir = log_dir
 
     def scrubber_cli(self, args: list[str], timeout) -> str:
         assert isinstance(self.env.pageserver_remote_storage, S3Storage)
@@ -4155,11 +4287,14 @@ class StorageScrubber:
         if s3_storage.endpoint is not None:
             env.update({"AWS_ENDPOINT_URL": s3_storage.endpoint})
 
-        base_args = [str(self.env.neon_binpath / "storage_scrubber")]
+        base_args = [
+            str(self.env.neon_binpath / "storage_scrubber"),
+            f"--controller-api={self.env.storage_controller_api}",
+        ]
         args = base_args + args
 
         (output_path, stdout, status_code) = subprocess_capture(
-            self.env.test_output_dir,
+            self.log_dir,
             args,
             echo_stderr=True,
             echo_stdout=True,
@@ -4198,7 +4333,10 @@ class StorageScrubber:
         log.info(f"tenant-snapshot output: {stdout}")
 
     def pageserver_physical_gc(
-        self, min_age_secs: int, tenant_ids: Optional[list[TenantId]] = None
+        self,
+        min_age_secs: int,
+        tenant_ids: Optional[list[TenantId]] = None,
+        mode: Optional[str] = None,
     ):
         args = ["pageserver-physical-gc", "--min-age", f"{min_age_secs}s"]
 
@@ -4207,6 +4345,9 @@ class StorageScrubber:
 
         for tenant_id in tenant_ids:
             args.extend(["--tenant-id", str(tenant_id)])
+
+        if mode is not None:
+            args.extend(["--mode", mode])
 
         stdout = self.scrubber_cli(
             args,

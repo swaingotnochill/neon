@@ -47,6 +47,9 @@ use utils::{
 project_git_version!(GIT_VERSION);
 project_build_tag!(BUILD_TAG);
 
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 const PID_FILE_NAME: &str = "pageserver.pid";
 
 const FEATURES: &[&str] = &[
@@ -382,7 +385,7 @@ fn start_pageserver(
     let shutdown_pageserver = tokio_util::sync::CancellationToken::new();
 
     // Set up remote storage client
-    let remote_storage = create_remote_storage_client(conf)?;
+    let remote_storage = BACKGROUND_RUNTIME.block_on(create_remote_storage_client(conf))?;
 
     // Set up deletion queue
     let (deletion_queue, deletion_workers) = DeletionQueue::new(
@@ -619,7 +622,6 @@ fn start_pageserver(
                         metric_collection_endpoint,
                         &conf.metric_collection_bucket,
                         conf.metric_collection_interval,
-                        conf.cached_metric_collection_interval,
                         conf.synthetic_size_calculation_interval,
                         conf.id,
                         local_disk_storage,
@@ -657,7 +659,6 @@ fn start_pageserver(
                 async move {
                     page_service::libpq_listener_main(
                         tenant_manager,
-                        broker_client,
                         pg_auth,
                         pageserver_listener,
                         conf.pg_auth_type,
@@ -700,7 +701,7 @@ fn start_pageserver(
     }
 }
 
-fn create_remote_storage_client(
+async fn create_remote_storage_client(
     conf: &'static PageServerConf,
 ) -> anyhow::Result<GenericRemoteStorage> {
     let config = if let Some(config) = &conf.remote_storage_config {
@@ -710,7 +711,7 @@ fn create_remote_storage_client(
     };
 
     // Create the client
-    let mut remote_storage = GenericRemoteStorage::from_config(config)?;
+    let mut remote_storage = GenericRemoteStorage::from_config(config).await?;
 
     // If `test_remote_failures` is non-zero, wrap the client with a
     // wrapper that simulates failures.
