@@ -248,6 +248,18 @@ impl LayerName {
             Image(_) => "image",
         }
     }
+
+    /// Gets the key range encoded in the layer name.
+    pub fn key_range(&self) -> &Range<Key> {
+        match &self {
+            LayerName::Image(layer) => &layer.key_range,
+            LayerName::Delta(layer) => &layer.key_range,
+        }
+    }
+
+    pub fn is_delta(&self) -> bool {
+        matches!(self, LayerName::Delta(_))
+    }
 }
 
 impl fmt::Display for LayerName {

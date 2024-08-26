@@ -31,12 +31,12 @@ pub struct Waiters<T>(pub(self) Mutex<HashMap<String, oneshot::Sender<T>>>);
 
 impl<T> Default for Waiters<T> {
     fn default() -> Self {
-        Waiters(Default::default())
+        Waiters(Mutex::default())
     }
 }
 
 impl<T> Waiters<T> {
-    pub fn register(&self, key: String) -> Result<Waiter<T>, RegisterError> {
+    pub fn register(&self, key: String) -> Result<Waiter<'_, T>, RegisterError> {
         let (tx, rx) = oneshot::channel();
 
         self.0
@@ -111,7 +111,7 @@ mod tests {
 
         let waiters = Arc::clone(&waiters);
         let notifier = tokio::spawn(async move {
-            waiters.notify(key, Default::default())?;
+            waiters.notify(key, ())?;
             Ok(())
         });
 

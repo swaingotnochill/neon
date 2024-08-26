@@ -67,7 +67,7 @@ impl<S: AsyncRead + Unpin> PqStream<S> {
             FeMessage::PasswordMessage(msg) => Ok(msg),
             bad => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("unexpected message type: {:?}", bad),
+                format!("unexpected message type: {bad:?}"),
             )),
         }
     }
@@ -234,7 +234,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Stream<S> {
                 .await
                 .inspect_err(|_| {
                     if record_handshake_error {
-                        Metrics::get().proxy.tls_handshake_failures.inc()
+                        Metrics::get().proxy.tls_handshake_failures.inc();
                     }
                 })?),
             Stream::Tls { .. } => Err(StreamUpgradeError::AlreadyTls),

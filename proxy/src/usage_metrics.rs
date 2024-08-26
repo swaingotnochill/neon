@@ -357,11 +357,15 @@ pub async fn task_backup(
         info!("metrics backup has shut down");
     }
     // Even if the remote storage is not configured, we still want to clear the metrics.
-    let storage = backup_config
-        .remote_storage_config
-        .as_ref()
-        .map(|config| GenericRemoteStorage::from_config(config).context("remote storage init"))
-        .transpose()?;
+    let storage = if let Some(config) = backup_config.remote_storage_config.as_ref() {
+        Some(
+            GenericRemoteStorage::from_config(config)
+                .await
+                .context("remote storage init")?,
+        )
+    } else {
+        None
+    };
     let mut ticker = tokio::time::interval(backup_config.interval);
     let mut prev = Utc::now();
     let hostname = hostname::get()?.as_os_str().to_string_lossy().into_owned();
@@ -446,12 +450,9 @@ async fn upload_events_chunk(
     remote_path: &RemotePath,
     cancel: &CancellationToken,
 ) -> anyhow::Result<()> {
-    let storage = match storage {
-        Some(storage) => storage,
-        None => {
-            error!("no remote storage configured");
-            return Ok(());
-        }
+    let Some(storage) = storage else {
+        error!("no remote storage configured");
+        return Ok(());
     };
     let data = serde_json::to_vec(&chunk).context("serialize metrics")?;
     let mut encoder = GzipEncoder::new(Vec::new());

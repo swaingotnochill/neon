@@ -16,9 +16,9 @@ from fixtures.neon_fixtures import (
 )
 from fixtures.pageserver.http import PageserverApiException
 from fixtures.pageserver.utils import (
-    MANY_SMALL_LAYERS_TENANT_CONFIG,
     assert_prefix_empty,
     assert_prefix_not_empty,
+    many_small_layers_tenant_config,
     poll_for_remote_storage_iterations,
     timeline_delete_wait_completed,
     wait_for_last_record_lsn,
@@ -485,6 +485,9 @@ def test_timeline_delete_fail_before_local_delete(neon_env_builder: NeonEnvBuild
         lambda: assert_prefix_empty(neon_env_builder.pageserver_remote_storage),
     )
 
+    # We deleted our only tenant, and the scrubber fails if it detects nothing
+    neon_env_builder.disable_scrub_on_exit()
+
 
 @pytest.mark.parametrize(
     "stuck_failpoint",
@@ -703,6 +706,9 @@ def test_timeline_delete_works_for_remote_smoke(
     # Assume it is mock server inconsistency and check twice.
     wait_until(2, 0.5, lambda: assert_prefix_empty(neon_env_builder.pageserver_remote_storage))
 
+    # We deleted our only tenant, and the scrubber fails if it detects nothing
+    neon_env_builder.disable_scrub_on_exit()
+
 
 def test_delete_orphaned_objects(
     neon_env_builder: NeonEnvBuilder,
@@ -776,7 +782,7 @@ def test_timeline_delete_resumed_on_attach(
     remote_storage_kind = s3_storage()
     neon_env_builder.enable_pageserver_remote_storage(remote_storage_kind)
 
-    env = neon_env_builder.init_start(initial_tenant_conf=MANY_SMALL_LAYERS_TENANT_CONFIG)
+    env = neon_env_builder.init_start(initial_tenant_conf=many_small_layers_tenant_config())
 
     tenant_id = env.initial_tenant
 

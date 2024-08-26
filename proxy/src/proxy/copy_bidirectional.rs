@@ -184,7 +184,7 @@ impl CopyBuffer {
                 }
                 Poll::Pending
             }
-            res => res.map_err(ErrorDirection::Write),
+            res @ Poll::Ready(_) => res.map_err(ErrorDirection::Write),
         }
     }
 
@@ -230,11 +230,10 @@ impl CopyBuffer {
                         io::ErrorKind::WriteZero,
                         "write zero byte into writer",
                     ))));
-                } else {
-                    self.pos += i;
-                    self.amt += i as u64;
-                    self.need_flush = true;
                 }
+                self.pos += i;
+                self.amt += i as u64;
+                self.need_flush = true;
             }
 
             // If pos larger than cap, this loop will never stop.

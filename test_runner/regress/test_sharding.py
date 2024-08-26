@@ -12,7 +12,6 @@ from fixtures.neon_fixtures import (
     NeonEnv,
     NeonEnvBuilder,
     StorageControllerApiException,
-    StorageScrubber,
     last_flush_lsn_upload,
     tenant_get_shards,
     wait_for_last_flush_lsn,
@@ -48,9 +47,6 @@ def test_sharding_smoke(
     # Use S3-compatible remote storage so that we can scrub: this test validates
     # that the scrubber doesn't barf when it sees a sharded tenant.
     neon_env_builder.enable_pageserver_remote_storage(s3_storage())
-    neon_env_builder.enable_scrub_on_exit()
-
-    neon_env_builder.preserve_database_files = True
 
     env = neon_env_builder.init_start(
         initial_tenant_shard_count=shard_count, initial_tenant_shard_stripe_size=stripe_size
@@ -128,8 +124,8 @@ def test_sharding_smoke(
 
     # Check the scrubber isn't confused by sharded content, then disable
     # it during teardown because we'll have deleted by then
-    StorageScrubber(neon_env_builder).scan_metadata()
-    neon_env_builder.scrub_on_exit = False
+    healthy, _ = env.storage_scrubber.scan_metadata()
+    assert healthy
 
     env.storage_controller.pageserver_api().tenant_delete(tenant_id)
     assert_prefix_empty(
@@ -201,14 +197,15 @@ def test_sharding_split_compaction(neon_env_builder: NeonEnvBuilder, failpoint: 
         # disable background compaction and GC. We invoke it manually when we want it to happen.
         "gc_period": "0s",
         "compaction_period": "0s",
-        # create image layers eagerly, so that GC can remove some layers
-        "image_creation_threshold": 1,
+        # Disable automatic creation of image layers, as we will create them explicitly when we want them
+        "image_creation_threshold": 9999,
         "image_layer_creation_check_threshold": 0,
     }
 
     neon_env_builder.storage_controller_config = {
         # Default neon_local uses a small timeout: use a longer one to tolerate longer pageserver restarts.
-        "max_unavailable": "300s"
+        "max_offline": "30s",
+        "max_warming_up": "300s",
     }
 
     env = neon_env_builder.init_start(initial_tenant_conf=TENANT_CONF)
@@ -224,6 +221,12 @@ def test_sharding_split_compaction(neon_env_builder: NeonEnvBuilder, failpoint: 
     workload.write_rows(256)
     workload.validate()
     workload.stop()
+
+    # Do a full image layer generation before splitting, so that when we compact after splitting
+    # we should only see sizes decrease (from post-split drops/rewrites), not increase (from image layer generation)
+    env.get_tenant_pageserver(tenant_id).http_client().timeline_checkpoint(
+        tenant_id, timeline_id, force_image_layer_creation=True, wait_until_uploaded=True
+    )
 
     # Split one shard into two
     shards = env.storage_controller.tenant_shard_split(tenant_id, shard_count=2)
@@ -367,9 +370,6 @@ def test_sharding_split_smoke(
     # Use S3-compatible remote storage so that we can scrub: this test validates
     # that the scrubber doesn't barf when it sees a sharded tenant.
     neon_env_builder.enable_pageserver_remote_storage(s3_storage())
-    neon_env_builder.enable_scrub_on_exit()
-
-    neon_env_builder.preserve_database_files = True
 
     non_default_tenant_config = {"gc_horizon": 77 * 1024 * 1024}
 
@@ -394,6 +394,7 @@ def test_sharding_split_smoke(
 
     # Note which pageservers initially hold a shard after tenant creation
     pre_split_pageserver_ids = [loc["node_id"] for loc in env.storage_controller.locate(tenant_id)]
+    log.info("Pre-split pageservers: {pre_split_pageserver_ids}")
 
     # For pageservers holding a shard, validate their ingest statistics
     # reflect a proper splitting of the WAL.
@@ -555,9 +556,9 @@ def test_sharding_split_smoke(
     assert sum(total.values()) == split_shard_count * 2
     check_effective_tenant_config()
 
-    # More specific check: that we are fully balanced.  This is deterministic because
-    # the order in which we consider shards for optimization is deterministic, and the
-    # order of preference of nodes is also deterministic (lower node IDs win).
+    # More specific check: that we are fully balanced.  It is deterministic that we will get exactly
+    # one shard on each pageserver, because for these small shards the utilization metric is
+    # dominated by shard count.
     log.info(f"total: {total}")
     assert total == {
         1: 1,
@@ -577,8 +578,14 @@ def test_sharding_split_smoke(
         15: 1,
         16: 1,
     }
+
+    # The controller is not required to lay out the attached locations in any particular way, but
+    # all the pageservers that originally held an attached shard should still hold one, otherwise
+    # it would indicate that we had done some unnecessary migration.
     log.info(f"attached: {attached}")
-    assert attached == {1: 1, 2: 1, 3: 1, 5: 1, 6: 1, 7: 1, 9: 1, 11: 1}
+    for ps_id in pre_split_pageserver_ids:
+        log.info("Pre-split pageserver {ps_id} should still hold an attached location")
+        assert ps_id in attached
 
     # Ensure post-split pageserver locations survive a restart (i.e. the child shards
     # correctly wrote config to disk, and the storage controller responds correctly
